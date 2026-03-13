@@ -7,46 +7,50 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title="Stock Prediction Dashboard", layout="wide")
 
-# ---------------- SIDEBAR ---------------- #
+# -------- SIDEBAR -------- #
 
-st.sidebar.title("👨‍💻 Developer Info")
+st.sidebar.title("👨‍💻 Developer")
 
 st.sidebar.markdown("""
-**Name:** Abhishek Shelke  
+**Abhishek Shelke**
 
-**Program:** M.Sc Computer Science  
+M.Sc Computer Science  
 ASM's CSIT, Pimpri  
 
-**Interest:**  
-- Data Science  
-- Machine Learning  
-- Artificial Intelligence  
+**Interests**
+- Data Science
+- Machine Learning
+- AI
 
-**GitHub:**  
-https://github.com/Redskull2525  
+GitHub  
+https://github.com/Redskull2525
 
-**LinkedIn:**  
+LinkedIn  
 https://www.linkedin.com/in/abhishek-s-b98895249
 """)
-
-st.sidebar.markdown("---")
 
 ticker = st.sidebar.text_input("Stock Ticker", "AAPL")
 period = st.sidebar.selectbox("Data Period", ["1y","2y","5y"])
 
-# ---------------- TITLE ---------------- #
+# -------- LOAD MODEL -------- #
 
-st.title("📈 Machine Learning Stock Prediction Dashboard")
+model_data = joblib.load("aapl_stock_model.pkl")
+model = model_data["model"]
+features = model_data["features"]
 
-# ---------------- DATA ---------------- #
+# -------- LOAD DATA -------- #
 
 @st.cache_data
 def load_data(ticker, period):
 
     df = yf.download(ticker, period=period, interval="1d", auto_adjust=True)
 
-    df['SMA_7'] = df['Close'].rolling(7).mean()
-    df['SMA_21'] = df['Close'].rolling(21).mean()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    # indicators
+    df["SMA_7"] = df["Close"].rolling(7).mean()
+    df["SMA_21"] = df["Close"].rolling(21).mean()
 
     df = df.dropna()
 
@@ -54,27 +58,32 @@ def load_data(ticker, period):
 
 df = load_data(ticker, period)
 
-st.subheader("Recent Stock Data")
+st.title("📈 Stock Price Prediction Dashboard")
+
+st.subheader("Latest Stock Data")
 
 st.dataframe(df.tail())
 
-# ---------------- FEATURES ---------------- #
+# -------- FEATURES -------- #
 
-features = ['Close','High','Low','Open','Volume','SMA_7','SMA_21']
+X = df[features].copy()
 
-X = df[features]
+X = X.dropna()
 
-# ---------------- LOAD MODEL ---------------- #
+# safety check
+if len(X) == 0:
+    st.error("Not enough data to make prediction")
+    st.stop()
 
-model = joblib.load("aapl_stock_model.pkl")
-
-# ---------------- PREDICTION ---------------- #
+# -------- PREDICTION -------- #
 
 predictions = model.predict(X)
 
+df = df.loc[X.index]
+
 df["Predicted"] = predictions
 
-# ---------------- GRAPH ---------------- #
+# -------- GRAPH -------- #
 
 st.subheader("📊 Actual vs Predicted Price")
 
@@ -82,24 +91,24 @@ fig = go.Figure()
 
 fig.add_trace(go.Scatter(
     x=df.index,
-    y=df['Close'],
+    y=df["Close"],
     name="Actual Price"
 ))
 
 fig.add_trace(go.Scatter(
     x=df.index,
-    y=df['Predicted'],
+    y=df["Predicted"],
     name="Predicted Price"
 ))
 
 st.plotly_chart(fig, use_container_width=True)
 
-# ---------------- NEXT DAY PREDICTION ---------------- #
+# -------- NEXT DAY PREDICTION -------- #
 
-latest = df[features].iloc[-1:]
+latest = X.tail(1)
 
 next_price = model.predict(latest)[0]
 
-st.subheader("🔮 Tomorrow Prediction")
+st.subheader("🔮 Next Day Prediction")
 
 st.metric("Predicted Next Day Price", f"${next_price:.2f}")
