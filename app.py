@@ -34,9 +34,9 @@ period = st.sidebar.selectbox("Data Period", ["1y","2y","5y"])
 
 # -------- LOAD MODEL -------- #
 
-model_data = joblib.load("aapl_stock_model.pkl")
-model = model_data["model"]
-features = model_data["features"]
+model = joblib.load("aapl_stock_model.pkl")
+
+features = ['Close','High','Low','Open','Volume','SMA_7','SMA_21']
 
 # -------- LOAD DATA -------- #
 
