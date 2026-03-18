@@ -1,154 +1,111 @@
-```python
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import joblib
 import plotly.graph_objects as go
+from train_model import StockPredictionModel   # reuse feature engineering
 
-# -------- PAGE CONFIG -------- #
-st.set_page_config(page_title="Stock Prediction Dashboard", layout="wide")
 
-# -------- SIDEBAR -------- #
-st.sidebar.title("👨‍💻 Developer")
+# ── Page config ──────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Stock Predictor", layout="wide", page_icon="📈")
 
-st.sidebar.markdown("""
-**Abhishek Shelke**
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.title("👨‍💻 Developer")
+    st.markdown("**Abhishek Shelke**")
+    st.markdown("M.Sc Computer Science  \nASM's CSIT, Pimpri")
+    st.markdown("**Interests:** Data Science · Machine Learning · AI")
+    st.markdown("[GitHub](https://github.com/Redskull2525) | [LinkedIn](https://www.linkedin.com/in/abhishek-s-b98895249)")
+    st.divider()
 
-M.Sc Computer Science  
-ASM's CSIT, Pimpri  
+    ticker = st.text_input("Stock Ticker", value="AAPL").upper()
+    period = st.selectbox("Data Period", ["1y", "2y", "3y", "5y"], index=3)
 
-**Interests**
-- Data Science
-- Machine Learning
-- AI
-
-GitHub  
-https://github.com/Redskull2525
-
-LinkedIn  
-https://www.linkedin.com/in/abhishek-s-b98895249
-""")
-
-# -------- INPUT -------- #
-ticker = st.sidebar.text_input("Stock Ticker", "AAPL").upper().strip()
-period = st.sidebar.selectbox("Data Period", ["6mo", "1y", "2y", "5y"])
-
-# -------- LOAD MODEL -------- #
-try:
-    model = joblib.load("aapl_stock_model.pkl")
-except:
-    st.error("❌ Model file not found. Make sure 'aapl_stock_model.pkl' is uploaded.")
-    st.stop()
-
-features = ['Close','High','Low','Open','Volume','SMA_7','SMA_21']
-
-# -------- LOAD DATA FUNCTION -------- #
-@st.cache_data
+# ── Load & preprocess ─────────────────────────────────────────────────────────
+@st.cache_data(ttl=3600)
 def load_data(ticker, period):
-    try:
-        df = yf.download(ticker, period=period, interval="1d", auto_adjust=True)
+    m = StockPredictionModel(ticker, period)
+    m.fetch_and_preprocess()
+    return m
 
-        # Check if data exists
-        if df is None or df.empty:
-            return None
+@st.cache_resource
+def load_model():
+    return joblib.load("aapl_stock_model.pkl")
 
-        # Fix multi-index issue
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+with st.spinner("Fetching data..."):
+    stock_model = load_data(ticker, period)
+    df = stock_model.df
 
-        # Required columns check
-        required_cols = ["Close", "High", "Low", "Open", "Volume"]
-        for col in required_cols:
-            if col not in df.columns:
-                return None
+saved = load_model()
+model    = saved["model"]
+scaler   = saved["scaler"]
+features = saved["features"]
 
-        # -------- FEATURE ENGINEERING -------- #
-        df["SMA_7"] = df["Close"].rolling(7).mean()
-        df["SMA_21"] = df["Close"].rolling(21).mean()
+# ── Align features (model trained on AAPL features; app may use different ticker) ──
+X = df[features]
+X_scaled = scaler.transform(X)
+df['Predicted'] = model.predict(X_scaled)
 
-        # Drop NaN values
-        df = df.dropna()
-
-        # Ensure enough data
-        if len(df) < 30:
-            return None
-
-        return df
-
-    except Exception as e:
-        print(e)
-        return None
-
-# -------- LOAD DATA -------- #
-df = load_data(ticker, period)
-
-# -------- ERROR HANDLING -------- #
-if df is None or df.empty:
-    st.error("⚠️ Failed to fetch enough stock data.\n\nTry:\n- Different ticker (e.g., AAPL, MSFT)\n- Longer period (1y or 2y)")
-    st.stop()
-
-# -------- TITLE -------- #
+# ── Latest data table ─────────────────────────────────────────────────────────
 st.title("📈 Stock Price Prediction Dashboard")
-
-# -------- SHOW DATA -------- #
-st.subheader("Latest Stock Data")
-st.dataframe(df.tail())
-
-# -------- PREPARE FEATURES -------- #
-X = df[features].copy()
-
-if len(X) == 0:
-    st.error("❌ Not enough processed data for prediction")
-    st.stop()
-
-# -------- PREDICTION -------- #
-predictions = model.predict(X)
-
-df = df.loc[X.index]
-df["Predicted"] = predictions
-
-# -------- GRAPH -------- #
-st.subheader("📊 Actual vs Predicted Price")
-
-fig = go.Figure()
-
-fig.add_trace(go.Scatter(
-    x=df.index,
-    y=df["Close"],
-    name="Actual Price",
-    mode='lines'
-))
-
-fig.add_trace(go.Scatter(
-    x=df.index,
-    y=df["Predicted"],
-    name="Predicted Price",
-    mode='lines'
-))
-
-fig.update_layout(
-    template="plotly_dark",
-    xaxis_title="Date",
-    yaxis_title="Price",
-    legend_title="Legend"
+st.subheader("📋 Latest Stock Data")
+display_cols = ['Close', 'High', 'Low', 'Open', 'Volume', 'SMA_7', 'SMA_21']
+st.dataframe(
+    df[display_cols].tail(5).rename(index=lambda i: df.index[i] if hasattr(df.index, '__getitem__') else i),
+    use_container_width=True
 )
 
+# ── Actual vs Predicted chart ─────────────────────────────────────────────────
+st.subheader("📊 Actual vs Predicted Price")
+
+split = int(len(df) * 0.8)
+test_df = df.iloc[split:].copy()
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(
+    x=list(range(len(test_df))),
+    y=test_df['Close'],
+    mode='lines', name='Actual Price',
+    line=dict(color='white', width=1.5)
+))
+fig.add_trace(go.Scatter(
+    x=list(range(len(test_df))),
+    y=test_df['Predicted'],
+    mode='lines', name='Predicted Price',
+    line=dict(color='cyan', width=1.5, dash='dot')
+))
+fig.update_layout(
+    template='plotly_dark',
+    xaxis_title='Trading Days (Test Set)',
+    yaxis_title='Price (USD)',
+    legend=dict(orientation='h', y=1.1),
+    height=450
+)
 st.plotly_chart(fig, use_container_width=True)
 
-# -------- NEXT DAY PREDICTION -------- #
-latest = X.tail(1)
+# ── Next-day prediction ───────────────────────────────────────────────────────
+st.subheader("🔮 Next-Day Price Prediction")
+latest_features = df[features].tail(1)
+latest_scaled   = scaler.transform(latest_features)
+next_day_pred   = model.predict(latest_scaled)[0]
+last_close      = df['Close'].iloc[-1]
+delta           = next_day_pred - last_close
+pct             = (delta / last_close) * 100
 
-try:
-    next_price = model.predict(latest)[0]
+col1, col2, col3 = st.columns(3)
+col1.metric("Last Close",      f"${last_close:.2f}")
+col2.metric("Predicted Close", f"${next_day_pred:.2f}", f"{delta:+.2f}")
+col3.metric("Expected Move",   f"{pct:+.2f}%")
 
-    st.subheader("🔮 Next Day Prediction")
-    st.metric("Predicted Next Day Price", f"${next_price:.2f}")
+# ── Model metrics ─────────────────────────────────────────────────────────────
+from sklearn.metrics import mean_squared_error, r2_score
+mse  = mean_squared_error(test_df['Close'], test_df['Predicted'])
+rmse = np.sqrt(mse)
+r2   = r2_score(test_df['Close'], test_df['Predicted'])
 
-except:
-    st.warning("Prediction failed. Try another stock.")
-
-# -------- FOOTER -------- #
-st.markdown("---")
-st.markdown("⭐ Built with Streamlit | Machine Learning Project by Abhishek Shelke")
-```
+st.subheader("📐 Model Performance (Test Set)")
+m1, m2, m3 = st.columns(3)
+m1.metric("RMSE",    f"{rmse:.4f}")
+m2.metric("MSE",     f"{mse:.4f}")
+m3.metric("R² Score",f"{r2:.4f}")
