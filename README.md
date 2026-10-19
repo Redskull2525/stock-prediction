@@ -199,6 +199,12 @@ Adding both is the next improvement for this project. The live values appear in 
 
 ---
 
+## 🎓 Interview guide
+
+[`docs/INTERVIEW_GUIDE.md`](docs/INTERVIEW_GUIDE.md) is a beginner-friendly walkthrough of this project: feature engineering, leakage-safe evaluation, why price R² is near-trivial, known bugs, likely interview questions and hands-on exercises.
+
+---
+
 ## 🔄 Auto-Retraining Logic
 
 | Condition | Behaviour |
