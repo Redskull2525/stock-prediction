@@ -23,12 +23,17 @@ MODEL_PATH   = "aapl_stock_model.pkl"
 REFRESH_SECS = 30
 ET           = ZoneInfo("America/New_York")
 
-# ── API key: Streamlit Secrets → env var → hardcoded fallback ────────────────
+# ── API key: Streamlit Secrets → env var (never hardcode keys) ───────────────
 def get_api_key() -> str:
     try:
         return st.secrets["TWELVE_DATA_API_KEY"]
     except Exception:
-        return os.environ.get("TWELVE_DATA_API_KEY", "b6c3629a148846c1b256838291330785")
+        key = os.environ.get("TWELVE_DATA_API_KEY")
+        if not key:
+            st.error("TWELVE_DATA_API_KEY is not set. Add it to .streamlit/secrets.toml "
+                     "or as an environment variable (see README).")
+            st.stop()
+        return key
 
 
 # ══════════════════════════════════════════════════════════════════════════════
