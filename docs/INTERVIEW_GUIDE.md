@@ -2,7 +2,7 @@
 
 This guide helps you explain and defend this project honestly. It is written for a beginner: every term is explained. **No performance numbers appear in it, because the app recomputes them on every retrain and none are stored in the repo.** If an interviewer asks "what was your RMSE?", give the honest answer: *"It changes with each retrain. More importantly, RMSE on price on its own doesn't prove anything. Here is how I'd evaluate it properly."* Then explain section 8.
 
-Code references are `app.py:line`.
+Code references are `file:line`. **Sections 4–6 describe the original code** (commit `10ceeaa`, view it with `git show 10ceeaa:app.py`); since the Oct 2026 fixes, the feature, target, split and metric logic lives in `stock_core.py`. Section 7 explains what changed and why.
 
 ---
 
@@ -159,34 +159,50 @@ On startup, if the model is stale **and** the market is closed, the app retrains
 
 ---
 
-## 7. Bugs and weak spots I found (know these cold, they show maturity)
+## 7. Bugs I found and fixed (know these cold, they show maturity)
 
-Present these as "things I found reviewing my own code". Each one was checked against the code.
+Present these as "things I found reviewing my own code, then fixed with tests". Each one was checked against the old code before it was fixed. **Status: B1–B5 fixed in Oct 2026.** The old line numbers below (`old app.py:line`) refer to commit `10ceeaa`; you can see that version with `git show 10ceeaa:app.py`. The fixed logic is in `stock_core.py`, a small module with no Streamlit or network code, so it can be tested with hand-made price series (`tests/test_core.py`).
 
-**B1. Off-by-one in the training metrics (`app.py:159`).**
-For test row *t*, `pred_returns` estimates the change from Close(t) to Close(t+1), and `y_test_price` is Close(t+1). But `prev_closes` is Close(t−1), one day too early. The correct line is `df['Close'].iloc[split:].values`. As written, the "prediction" is based on a price two days before the target, which makes the RMSE look worse than the model really is.
+**The one rule behind every fix.** Row *t* holds features from days ≤ *t*, plus `Target_return` = Close(t+1)/Close(t) − 1, `Target_price` = Close(t+1) and `Target_date` = Date(t+1) (`stock_core.py:100-102`). So the model's output for row *t* is a forecast **for** Date(t+1), and the matching price is `Predicted(t+1) = Close(t) × (1 + pred(t))`. Every prediction is stored under the date it is for.
 
-**B2. Misaligned chart in the dashboard (`app.py:283-285`).**
-`Predicted(t) = Close(t−1) × (1 + pred(t))`, but `pred(t)` is the forecast for t→t+1, not for t−1→t. To predict Close(t), you should use `pred(t−1)`, for example `df['Predicted'] = df['Close'].shift(1) * (1 + pd.Series(pred_returns).shift(1))`. The R²/RMSE in the "Model Performance" panel (`app.py:325-327`) inherits this problem.
+**B1. Off-by-one base price in the training metrics. Fixed.**
+- *Old code (old `app.py:159`):* `prev_closes = df['Close'].iloc[split-1:-1].values`. For test row *t*, `pred_returns` estimates Close(t) → Close(t+1) and `y_test_price` is Close(t+1), but `prev_closes` was Close(t−1), one day too early. The "prediction" was built on a price two days before the target, so the saved RMSE was measured against the wrong base (the extra day's move was counted as model error).
+- *Fix:* `predictions_frame()` (`stock_core.py:159-176`) uses each row's **own** `Close` as the base (`stock_core.py:166`) and that row's `Target_price` as the actual (`stock_core.py:173`). Base and target come from the same row, so they can't drift apart. `train_bundle()` (`stock_core.py:253-281`) uses it for the saved metrics.
+- *Test:* `test_reconstruction_uses_todays_close` gives a "perfect" model the true returns and checks Predicted equals Actual exactly; it also shows the old Close(t−1) formula fails even for a perfect model.
 
-**B3. The "next-day" prediction is one day stale (`app.py:129`, `app.py:313-315`).**
-`dropna()` drops the newest row, because its target is unknown. So `df.tail(1)` is the *second-newest* day, and the forecast is for a day whose close is already known. (I verified this: on a 300-row test frame, the feature table ended one date before the raw data.) Fix: build the inference features without dropping on the target columns, for example `dropna(subset=features)`.
+**B2. The chart's predicted line was misaligned by a day. Fixed.**
+- *Old code (old `app.py:283-285`, `298-301`):* `Predicted(t) = Close(t−1) × (1 + pred(t))`, plotted against Close(t). But `pred(t)` is the forecast for t → t+1, and it was built from day *t*'s features, which already include Close(t). The x-axis was row numbers (`range(len(test_df))`), so nothing showed the dates were off. The "Model Performance" metrics (old `app.py:325-327`) inherited the problem.
+- *Fix:* `predictions_frame()` indexes every prediction by `Target_date` (`stock_core.py:175`). The chart (`app.py:236-252`) plots `Actual` and `Predicted` from that same frame against real dates, so on each date both lines refer to the same day's close. A predicted point for day D is Close(D−1) × (1 + pred(D−1)).
+- *Tests:* `test_prediction_frame_is_indexed_by_the_date_it_is_for` and `test_rows_with_missing_features_do_not_shift_the_alignment` (one bad row in the middle must not shift the dates).
 
-**B4. The model can be applied to the wrong ticker.**
-The saved file stores `"ticker"`, but the dashboard never checks it. If you train on AAPL and then type MSFT, the AAPL model scores MSFT data. Fix: compare `meta["ticker"]` with the ticker in the box and retrain or warn.
+**B3. The "next-day" forecast used the second-newest day. Fixed.**
+- *Old code (old `app.py:129`, `313-315`):* `build_features()` ended with `dropna()`, which also dropped the newest row because its target (tomorrow) is NaN. So `df.tail(1)` was yesterday, and the forecast was for a day whose close was already known.
+- *Fix:* `build_feature_table()` (`stock_core.py:106-108`) keeps every row. Rows for training are filtered separately by `training_rows()` (`stock_core.py:116-119`), which needs a known target. The forecast uses `latest_feature_row()` (`stock_core.py:122-127`): the newest row with complete **features**, target allowed to be NaN. `next_day_forecast()` (`stock_core.py:185-198`) labels it with `next_trading_day()` (`stock_core.py:130-132`, next weekday; exchange holidays aren't known). The app shows "Last Close (date)" and "Predicted Close (day, date)" (`app.py:259-269`).
+- *Tests:* `test_forecast_uses_the_newest_row` (Friday's bar → forecast for Monday), `test_forecast_skips_a_newest_row_with_incomplete_features`, `test_next_trading_day`, and the smoke test `test_app_runs_and_shows_baseline`.
 
-**B5. The test window in the dashboard isn't the training test window.**
-The dashboard re-downloads data and takes `int(len(df)*0.8)` again. If new days have arrived since training, the split point moves, and some "test" rows were actually training rows. Fix: store the split date in the pickle and use it.
+**B4. The model could be applied to the wrong ticker. Fixed.**
+- *Old code:* the saved file stored `"ticker"`, but the dashboard never checked it. Train on AAPL, type MSFT, and the AAPL model scored MSFT.
+- *Fix:* `ticker_mismatch()` (`stock_core.py:289-292`) compares the saved ticker with the selected one (case and spaces ignored; a bundle with no ticker counts as a mismatch). The sidebar warns (`app.py:166-168`) and the dashboard refuses to show predictions until you click Retrain (`app.py:220-225`). I chose "refuse" over "retrain automatically" so that typing a ticker doesn't silently spend API calls and overwrite the saved model.
+- *Tests:* `test_ticker_mismatch` and the smoke test `test_app_refuses_model_for_other_ticker`.
 
-**B6. Smaller issues.**
-- The `period` selectbox (`app.py:210`) is never used.
-- `market_is_closed()` treats 00:00–09:30 ET and market holidays as "open".
-- The README mentions `train_model.py`, which isn't in the repo.
+**B5. The dashboard's test window wasn't the training test window. Fixed.**
+- *Old code:* the dashboard re-downloaded data and took `int(len(df)*0.8)` again, so the split moved as new days arrived.
+- *Fix:* the bundle now stores `ticker`, `train_start_date`, `train_end_date`, `test_start_date`, `test_end_date`, the feature list and the metrics (`stock_core.py:269-281`). `evaluation_window()` (`stock_core.py:144-153`) uses `test_start_date`; only old-format bundles fall back to re-splitting, and the app says so.
+- *Tests:* `test_evaluation_window_stays_fixed_when_new_days_arrive`, `test_chronological_split_has_no_overlap`.
+
+**Also added: an honest evaluation.** `evaluate_predictions()` (`stock_core.py:207-234`) returns the model's RMSE/MAE/R², the naive "tomorrow = today" RMSE/MAE, a skill score (1 − RMSE / naive RMSE), directional accuracy, and the up-day share (the accuracy of always guessing "up"; the naive forecast predicts "no change", so it has no direction of its own). They appear in the Model Status panel (`app.py:153-164`) and under Model Performance (`app.py:272-285`). Test: `test_metrics_against_naive_baseline` (worked by hand in the test's comments).
+
+**The old model file.** `aapl_stock_model.pkl` was saved before these fixes (scikit-learn 1.6.1, no dates, metrics computed with B1). It still loads and predicts; the app labels it "old format" and hides its metrics. Retrain to replace it. Tests: `test_existing_model_file_is_compatible`, `test_app_loads_legacy_model_file`.
+
+**B6. Smaller issues (still open).**
+- The `period` selectbox is never used.
+- `market_is_closed()` (`stock_core.py:295-297`) treats 00:00–09:30 ET and market holidays as "open".
 - On Streamlit Cloud the filesystem is temporary, so the `.pkl` can disappear and two visitors could trigger retraining at the same time.
 - `time.sleep(30)` blocks that session's script.
 - Each 30-second refresh makes a quote API call, which uses up the free daily quota quickly.
+- (Fixed: the README no longer mentions the missing `train_model.py`.)
 
-How to talk about it: *"These are exactly the bugs time-series code is prone to: alignment between features, targets and base prices. The fix is to write a tiny test with a hand-made 5-row price series where I know the right answer."* (Exercise 3.)
+How to talk about it: *"These are exactly the bugs time-series code is prone to: alignment between features, targets and base prices. I found them by reading my own code, then pinned each one down with a tiny test on a hand-made price series where I knew the right answer, and fixed the code so every prediction carries the date it's for."* (Exercise 3 asks you to explain why the old code was wrong.)
 
 ---
 
@@ -197,8 +213,8 @@ How to talk about it: *"These are exactly the bugs time-series code is prone to:
 | RMSE | √(mean((actual − predicted)²)) | Typical error in dollars. Big misses count extra. |
 | MAE | mean(\|actual − predicted\|) | Average error in dollars |
 | R² | 1 − SS_res / SS_tot | Share of variance explained, compared with predicting the mean |
-| **Directional accuracy** (not implemented) | share of days where sign(predicted return) = sign(actual return) | Did we get up vs down right? 50% is a coin flip. |
-| **Skill vs naive** (not implemented) | 1 − RMSE_model / RMSE_naive | > 0 means we beat "tomorrow = today" |
+| **Directional accuracy** (shown in the app) | share of days where sign(predicted return) = sign(actual return) | Did we get up vs down right? 50% is a coin flip. |
+| **Skill vs naive** (shown in the app) | 1 − RMSE_model / RMSE_naive | > 0 means we beat "tomorrow = today" |
 
 **Why R² on price is almost meaningless.** R² compares your error with the error of predicting the *average* price over the test period. A stock that went from $150 to $230 has a huge spread around its average. Any prediction that just stays close to yesterday's price follows the trend line and wipes out most of that spread. So the naive forecast "tomorrow's price = today's price" already scores a very high R² (the README says around 0.99 for this kind of data; check it yourself in Exercise 1). Any model that outputs a tiny return times yesterday's price inherits that score for free.
 
@@ -209,7 +225,7 @@ How to talk about it: *"These are exactly the bugs time-series code is prone to:
 4. Use walk-forward validation (train on years 1–3, test on year 4; then train on 1–4, test on 5), not a single split.
 5. If you claim it's useful for trading, include transaction costs.
 
-**What to say about the numbers in the app:** *"The app shows R² and RMSE, but I wouldn't use them as evidence the model works. I'd need to show it beats the naive RMSE and gets the direction right more often than the base rate. I haven't measured that yet. It's the next improvement, and it's in the README."*
+**What to say about the numbers in the app:** *"The app shows R² and RMSE, but I wouldn't use them as evidence the model works. I'd need to show it beats the naive RMSE and gets the direction right more often than the base rate. The app now shows both next to the model's numbers, and I read them from there after each retrain."*
 
 ---
 
@@ -252,7 +268,9 @@ What exists:
 - `errors="coerce"` for bad numbers.
 - Staleness checks for retraining.
 
-What doesn't exist: no automated tests, no naive baseline, no directional accuracy, no walk-forward validation.
+Added in Oct 2026: a pytest suite (`tests/`) with alignment, split, ticker and baseline tests on hand-made price series, Streamlit `AppTest` smoke tests with the API mocked, and GitHub Actions running them on every push; plus the naive baseline and directional accuracy in the app.
+
+Still missing: walk-forward validation and a leakage test (idea 2 below).
 
 What you would add:
 1. **An alignment unit test.** Feed a 10-row price series that rises exactly 1% per day. Then `Target_return` must be 0.01 on every row, and a perfect model's reconstructed price must equal `Target_price`. This test would catch B1, B2 and B3.
@@ -265,9 +283,9 @@ What you would add:
 
 - **Not trading advice.** Say it clearly. The app is a learning exercise.
 - Daily technical indicators carry very little predictive signal (market efficiency). There's no news, fundamentals or sentiment.
-- There is one model per ticker, and the retraining logic doesn't check which ticker the model was trained on.
+- There is one saved model at a time; the app refuses to use it for a different ticker until you retrain.
 - A single train/test split, with no walk-forward validation and no transaction costs.
-- The alignment bugs B1–B3 (section 7).
+- The alignment bugs B1–B5 are fixed (section 7), but there is still only a single split and no holiday calendar.
 - Free API limits. A 30-second refresh uses up the quota fast.
 - **Ethics:**
   - Showing a confident "Predicted Close" with a +/- delta can mislead non-experts into trading. Add a visible disclaimer and some kind of uncertainty display.
@@ -292,7 +310,7 @@ A: A random split lets the model train on days after the test days, which is loo
 
 **Q4. Your R² is high. Is the model good?**
 A: Not necessarily. R² on price is close to trivial, because "tomorrow = today" already scores very high. I'd judge it by RMSE versus that naive baseline, and by directional accuracy versus the up-day base rate.
-*Follow-up:* "What's your directional accuracy?" → I haven't measured it yet. It's the next improvement. I won't guess a number.
+*Follow-up:* "What's your directional accuracy?" → The app shows it after each retrain, next to the up-day share. It changes per retrain, so I won't quote a number from memory.
 
 **Q5. What is leakage, and where could it happen here?**
 A: Using information at training or prediction time that wouldn't be available in real life. Here it could come from a random split, from fitting the scaler on all the data, from centred rolling windows, or from accidentally including `Target_price` as a feature. The code avoids all four: it splits chronologically, fits the scaler on train only, uses backward-looking windows, and explicitly excludes the target columns.
@@ -314,7 +332,7 @@ A: Two different learners make different errors. Averaging them reduces variance
 *Follow-up:* "Did the ensemble beat each model alone?" → I didn't compare them separately. I'd add that ablation.
 
 **Q10. What does `shift(-1)` do in your target?**
-A: It moves the next row's value onto the current row, so each row's target is tomorrow's return. The last row then has no target and is dropped, which is why my next-day prediction needs the fix in B3.
+A: It moves the next row's value onto the current row, so each row's target is tomorrow's return. The last row then has no target and is dropped, for training, but it's kept for the next-day forecast. Dropping it was bug B3.
 
 **Q11. How would you test this code?**
 A: A synthetic price series with a known answer, to check alignment. A leakage test that changes the future and asserts the past features don't change. A baseline comparison.
@@ -330,7 +348,7 @@ A: I wouldn't claim that. Markets are largely efficient, daily technical signals
 A: For history, the app raises a clear `ValueError` with the API's message, and the dashboard shows the error. For the live quote, it returns `{"error": ...}`, and the UI shows a warning while the rest of the page still renders.
 
 **Q15. What bugs did you find in your own code?**
-A: The base-price off-by-one in the training metrics, the misaligned predicted line in the chart, the next-day forecast using the second-newest row because of `dropna`, and no check that the model's ticker matches the selected ticker. I'd fix them with an alignment unit test first.
+A: The base-price off-by-one in the training metrics, the misaligned predicted line in the chart, the next-day forecast using the second-newest row because of `dropna`, and no check that the model's ticker matches the selected ticker. I wrote alignment unit tests on hand-made price series first, then fixed the code so each prediction is stored with the date it's for.
 
 **Q16. Why are some features redundant?**
 A: `Momentum_5` equals `Return_lag_5`, and `ROC_5` is the same number times 100. Duplicates don't add information. They just split feature importance. I'd remove them.
@@ -366,25 +384,25 @@ Load the features with `build_features(fetch_historical("AAPL"))`. On the last 2
 Using `s = pd.Series([100, 101, 103, 102])`, write by hand what `s.pct_change()`, `s.pct_change().shift(-1)` and `s.shift(1)` produce, then check in Python.
 *Check:* `pct_change().shift(-1)` = [0.01, 0.0198, −0.0097, NaN].
 
-**Exercise 3: Write the alignment test (catches B1–B3).**
-Make 80 days of prices rising exactly 1% per day, run `build_features`, and assert that `Target_return` ≈ 0.01. Then show that with a "perfect" predicted return of 0.01, `Close.iloc[split:] * 1.01` equals `Target_price.iloc[split:]`, but `Close.iloc[split-1:-1] * 1.01` does not.
-*Check:* the second assertion fails. That's bug B1, demonstrated.
+**Exercise 3: Explain why the old code was wrong (B1–B3).**
+Run `git show 10ceeaa:app.py` and find old lines 159, 283-285 and 313. Using `s = pd.Series([100, 101, 103, 102])` and a "perfect" model whose predicted return for row *t* is exactly `s.pct_change().shift(-1)[t]`, work out by hand what the old `prev_closes * (1 + pred_returns)` gives for row 1 and row 2, and compare with the real next-day closes. Then explain in your own words why `dropna()` made `tail(1)` the second-newest day.
+*Check:* the old formula gives 100 × 1.0198 ≈ 101.98 for the day whose real close is 103, so even a perfect model "misses". Then read `tests/test_core.py::test_reconstruction_uses_todays_close`, which demonstrates the same thing, and `stock_core.py:159-176` for the fix.
 
 **Exercise 4: Directional accuracy.**
 After `train()`, compute `np.mean(np.sign(pred_returns) == np.sign(y_te))` and the up-day share `np.mean(y_te > 0)`.
 *Check:* is the model above the up-day share? Report honestly either way.
 
 **Exercise 5: Skill score.**
-Compute `1 - rmse_model / rmse_naive` on price, after fixing B1.
-*Check:* a value > 0 means you beat the naive forecast. Expect it to be close to 0.
+Read how `evaluate_predictions()` (`stock_core.py:207-234`) computes `skill = 1 - rmse / baseline_rmse`, then compute it yourself from the RMSE and naive RMSE the app shows after a retrain.
+*Check:* your number matches the app's "Skill vs naive". A value > 0 means you beat the naive forecast. Expect it to be close to 0.
 
 **Exercise 6: Walk-forward validation.**
 Use `sklearn.model_selection.TimeSeriesSplit(n_splits=5)` and record directional accuracy per fold.
 *Check:* do the folds vary a lot? That variation is your uncertainty.
 
-**Exercise 7: Fix B3.**
-Change the inference path so the newest row is kept, for example by dropping NaN only on the feature columns.
-*Check:* the "Last Close" in the app matches the live quote's previous close or the latest daily bar.
+**Exercise 7: Follow the B3 fix.**
+Read `latest_feature_row()` and `next_day_forecast()` (`stock_core.py:122-198`), then run `pytest tests/test_core.py -k forecast -v`.
+*Check:* you can explain why training uses `training_rows()` (needs a target) but the forecast uses `latest_feature_row()` (needs only features), and why the forecast for a Friday bar is labelled Monday.
 
 **Exercise 8: Secret hygiene.**
 Explain, in 3 sentences, why a key in git history must be revoked. Then run `git show 327a473 -- app.py` locally. The red (removed) lines show that the old version, key included, is still stored in history.
