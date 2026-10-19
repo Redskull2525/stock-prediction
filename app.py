@@ -1,25 +1,26 @@
 """
-app.py  —  Fully self-contained. No imports from train_model.
-All feature engineering, training, and inference live here.
+app.py  —  the Streamlit dashboard: data fetching, UI and the saved-model file.
+
+All the date-sensitive logic (features, targets, split, return -> price,
+next-day row, metrics) lives in stock_core.py, which has unit tests in tests/.
 """
 
 import streamlit as st
 import requests
 import pandas as pd
-import numpy as np
 import joblib
 import plotly.graph_objects as go
 import time, os
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, VotingRegressor
-from sklearn.metrics import mean_squared_error, r2_score
-from sklearn.preprocessing import StandardScaler
+
+import stock_core as core
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Stock Predictor", layout="wide", page_icon="📈")
 
-MODEL_PATH   = "aapl_stock_model.pkl"
+# STOCK_MODEL_PATH lets the tests use a temporary file instead of the real model.
+MODEL_PATH   = os.environ.get("STOCK_MODEL_PATH", "aapl_stock_model.pkl")
 REFRESH_SECS = 30
 ET           = ZoneInfo("America/New_York")
 
@@ -77,107 +78,20 @@ def fetch_live_quote(ticker: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FEATURE ENGINEERING
-# ══════════════════════════════════════════════════════════════════════════════
-def _rsi(s, p=14):
-    d = s.diff()
-    g = d.clip(lower=0).rolling(p).mean()
-    l = (-d.clip(upper=0)).rolling(p).mean()
-    return 100 - (100 / (1 + g / (l + 1e-9)))
-
-def _macd(s, fast=12, slow=26, sig=9):
-    m = s.ewm(span=fast,adjust=False).mean() - s.ewm(span=slow,adjust=False).mean()
-    sg = m.ewm(span=sig,adjust=False).mean()
-    return m, sg, m - sg
-
-def _bb(s, p=20):
-    mid = s.rolling(p).mean(); std = s.rolling(p).std()
-    u, l = mid + 2*std, mid - 2*std
-    return (u-l)/(mid+1e-9), (s-l)/(u-l+1e-9)
-
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    for w in [5,7,10,21,50]:
-        df[f'SMA_{w}'] = df['Close'].rolling(w).mean()
-        df[f'EMA_{w}'] = df['Close'].ewm(span=w,adjust=False).mean()
-    for w in [5,10,21,50]:
-        df[f'Close_SMA{w}_ratio'] = df['Close'] / (df[f'SMA_{w}'] + 1e-9)
-    for lag in [1,2,3,5,10]:
-        df[f'Return_lag_{lag}'] = df['Close'].pct_change(lag)
-    for lag in [1,2,3,5]:
-        df[f'Close_lag_{lag}_norm'] = df['Close'].shift(lag) / df['Close']
-    df['Volume_SMA_10'] = df['Volume'].rolling(10).mean()
-    df['Volume_ratio']  = df['Volume'] / (df['Volume_SMA_10'] + 1e-9)
-    df['Momentum_5']    = df['Close'].pct_change(5)
-    df['Momentum_10']   = df['Close'].pct_change(10)
-    df['Volatility_10'] = df['Close'].pct_change().rolling(10).std()
-    df['Volatility_21'] = df['Close'].pct_change().rolling(21).std()
-    df['Daily_Range']   = (df['High'] - df['Low']) / df['Close']
-    df['Body']          = abs(df['Close'] - df['Open']) / df['Close']
-    df['Upper_Wick']    = (df['High'] - df[['Close','Open']].max(axis=1)) / df['Close']
-    df['Lower_Wick']    = (df[['Close','Open']].min(axis=1) - df['Low'])  / df['Close']
-    df['RSI_14'] = _rsi(df['Close'], 14)
-    df['RSI_7']  = _rsi(df['Close'], 7)
-    df['MACD'], df['MACD_signal'], df['MACD_hist'] = _macd(df['Close'])
-    for c in ['MACD','MACD_signal','MACD_hist']:
-        df[c] /= df['Close']
-    df['BB_width'], df['BB_pct'] = _bb(df['Close'])
-    for p in [5,10,21]:
-        df[f'ROC_{p}'] = df['Close'].pct_change(p) * 100
-    df['Target_return'] = df['Close'].pct_change().shift(-1)
-    df['Target_price']  = df['Close'].shift(-1)
-    return df.dropna().reset_index(drop=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  TRAIN
+#  TRAIN  (the logic is in core.train_bundle; this just fetches and saves)
 # ══════════════════════════════════════════════════════════════════════════════
 def train(ticker: str) -> dict:
-    raw = fetch_historical(ticker)
-    df  = build_features(raw)
-    exclude  = {'Date','Target_return','Target_price'}
-    features = [c for c in df.columns if c not in exclude]
-
-    X, y = df[features], df['Target_return']
-    split = int(len(X) * 0.8)
-    X_tr, X_te = X.iloc[:split], X.iloc[split:]
-    y_tr, y_te = y.iloc[:split], y.iloc[split:]
-
-    scaler = StandardScaler()
-    X_tr_s = scaler.fit_transform(X_tr)
-    X_te_s = scaler.transform(X_te)
-
-    rf = RandomForestRegressor(n_estimators=500, max_depth=10,
-             min_samples_split=5, min_samples_leaf=2,
-             max_features=0.7, random_state=42, n_jobs=-1)
-    gb = GradientBoostingRegressor(n_estimators=300, learning_rate=0.05,
-             max_depth=5, subsample=0.8, random_state=42)
-    model = VotingRegressor([('rf', rf), ('gb', gb)])
-    model.fit(X_tr_s, y_tr)
-
-    pred_returns = model.predict(X_te_s)
-    prev_closes  = df['Close'].iloc[split-1:-1].values
-    y_pred_price = prev_closes * (1 + pred_returns)
-    y_test_price = df['Target_price'].iloc[split:].values
-
-    rmse = float(np.sqrt(mean_squared_error(y_test_price, y_pred_price)))
-    r2   = float(r2_score(y_test_price, y_pred_price))
-    mae  = float(np.mean(np.abs(y_test_price - y_pred_price)))
-
-    joblib.dump({"model": model, "scaler": scaler, "features": features,
-                 "ticker": ticker, "rmse": rmse, "r2": r2, "mae": mae,
-                 "trained_at": datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")},
-                MODEL_PATH)
-    return {"rmse": rmse, "r2": r2, "mae": mae,
-            "trained_at": datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")}
+    bundle = core.train_bundle(fetch_historical(ticker), ticker,
+                               trained_at=datetime.now(ET).strftime("%Y-%m-%d %H:%M ET"))
+    joblib.dump(bundle, MODEL_PATH)
+    return bundle
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 def market_is_closed() -> bool:
-    now = datetime.now(ET)
-    return now.weekday() >= 5 or now.hour >= 16
+    return core.market_is_closed(datetime.now(ET))
 
 def model_is_stale(hours=24) -> bool:
     if not os.path.exists(MODEL_PATH):
@@ -186,12 +100,25 @@ def model_is_stale(hours=24) -> bool:
     return (datetime.now(timezone.utc) - mtime) > timedelta(hours=hours)
 
 @st.cache_resource
+def _load_bundle(path: str, mtime: float) -> dict:
+    return joblib.load(path)            # mtime is only part of the cache key
+
 def load_model():
-    return joblib.load(MODEL_PATH)
+    """Return (bundle, error_message). bundle is None if missing or unreadable."""
+    if not os.path.exists(MODEL_PATH):
+        return None, None
+    try:
+        return _load_bundle(MODEL_PATH, os.path.getmtime(MODEL_PATH)), None
+    except Exception as e:              # e.g. saved with an incompatible scikit-learn
+        return None, f"{type(e).__name__}: {e}"
 
 @st.cache_data(ttl=3600)
 def get_df(ticker: str) -> pd.DataFrame:
-    return build_features(fetch_historical(ticker))
+    """Feature table for every downloaded day, including the newest one."""
+    return core.build_feature_table(fetch_historical(ticker))
+
+def pct(x) -> str:
+    return "n/a" if x is None or pd.isna(x) else f"{x*100:.1f}%"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -206,28 +133,44 @@ with st.sidebar:
                 "[LinkedIn](https://www.linkedin.com/in/abhishek-s-b98895249)")
     st.divider()
 
-    ticker = st.text_input("Stock Ticker", value="AAPL").upper()
+    ticker = st.text_input("Stock Ticker", value="AAPL").strip().upper()
     period = st.selectbox("Data Period", ["1y","2y","3y","5y"], index=3)
     st.divider()
 
     st.markdown("### 🤖 Model Status")
     stale = model_is_stale()
+    bundle, load_error = load_model()
 
-    if os.path.exists(MODEL_PATH):
-        try:
-            meta = joblib.load(MODEL_PATH)
-            st.success(f"✅ Model ready\n\n"
-                       f"🕒 `{meta.get('trained_at','unknown')}`\n\n"
-                       f"R²: `{meta.get('r2',0):.4f}` | RMSE: `{meta.get('rmse',0):.4f}`")
-        except Exception:
-            st.warning("⚠️ Could not read model metadata.")
-    else:
+    if load_error:
+        st.warning(f"⚠️ Saved model could not be loaded — click Retrain.\n\n`{load_error}`")
+    elif bundle is None:
         st.error("❌ No model — click Retrain.")
+    elif core.is_legacy_bundle(bundle):
+        st.info(f"✅ Model ready (old format, {bundle.get('ticker', '?')})\n\n"
+                f"🕒 `{bundle.get('trained_at','unknown')}`\n\n"
+                "Its saved metrics were computed by the old, buggy code, so they "
+                "are not shown. Retrain to get corrected metrics and the naive baseline.")
+    else:
+        st.success(f"✅ Model ready — **{bundle['ticker']}**\n\n"
+                   f"🕒 `{bundle['trained_at']}`\n\n"
+                   f"Train: `{bundle['train_start_date']}` → `{bundle['train_end_date']}`  \n"
+                   f"Test: `{bundle['test_start_date']}` → `{bundle['test_end_date']}`")
+        st.markdown(
+            "| Test set | Model | Naive (tomorrow = today) |\n|---|---|---|\n"
+            f"| RMSE | `{bundle['rmse']:.4f}` | `{bundle['baseline_rmse']:.4f}` |\n"
+            f"| Direction right | `{pct(bundle['directional_accuracy'])}` "
+            f"| `{pct(bundle['up_day_share'])}` (always 'up') |\n\n"
+            f"R²: `{bundle['r2']:.4f}` · Skill vs naive: `{bundle['skill']:+.4f}` "
+            "(> 0 means the model beats naive)")
+
+    if bundle is not None and core.ticker_mismatch(bundle, ticker):
+        st.warning(f"⚠️ This model was trained on **{bundle.get('ticker', 'an unknown ticker')}**, "
+                   f"not {ticker}. Click Retrain to train one for {ticker}.")
 
     if stale:
         st.warning("⚠️ Model is stale (> 24 h)")
 
-    if st.button("🔄 Retrain Now", type="primary", use_container_width=True):
+    if st.button("🔄 Retrain Now", type="primary", width="stretch"):
         with st.spinner("Fetching data & training... (~30s)"):
             result = train(ticker)
         st.success(f"✅ Trained at {result['trained_at']}\n\n"
@@ -241,12 +184,12 @@ with st.sidebar:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  AUTO-RETRAIN on startup if stale + market closed
+#  AUTO-RETRAIN on startup if stale (or unreadable) + market closed
 # ══════════════════════════════════════════════════════════════════════════════
-if stale and market_is_closed():
+if (stale or bundle is None) and market_is_closed():
     with st.spinner("🔄 Auto-retraining with latest data..."):
-        result = train(ticker)
-    st.toast(f"✅ Auto-retrained! R² = {result['r2']:.4f}")
+        bundle = train(ticker)
+    st.toast(f"✅ Auto-retrained! R² = {bundle['r2']:.4f}")
     st.cache_resource.clear()
     st.cache_data.clear()
 
@@ -274,62 +217,78 @@ else:
     st.warning(f"Live feed error: {quote['error']}")
 
 # ── Historical predictions ────────────────────────────────────────────────────
-try:
-    df   = get_df(ticker)
-    meta = load_model()
-    model, scaler, features = meta["model"], meta["scaler"], meta["features"]
+def show_predictions(bundle: dict, ticker: str, quote: dict) -> None:
+    if core.ticker_mismatch(bundle, ticker):
+        # Refuse rather than score one stock with another stock's model (bug B4).
+        st.warning(f"The saved model was trained on **{bundle.get('ticker', 'an unknown ticker')}**. "
+                   f"Click **Retrain Now** in the sidebar to train a model for **{ticker}**.")
+        return
 
-    pred_returns    = model.predict(scaler.transform(df[features]))
-    prev_closes     = df['Close'].shift(1).fillna(df['Close'].iloc[0]).values
-    df              = df.copy()
-    df['Predicted'] = prev_closes * (1 + pred_returns)
+    model, scaler, features = bundle["model"], bundle["scaler"], bundle["features"]
+    df = get_df(ticker)        # every day, including the newest (its target is NaN)
 
     # Latest data table
     st.subheader("📋 Latest Stock Data")
-    st.dataframe(df[['Close','High','Low','Open','Volume','SMA_7','SMA_21']].tail(5),
-                 use_container_width=True)
+    st.dataframe(df.set_index("Date")[['Close','High','Low','Open','Volume','SMA_7','SMA_21']].tail(5),
+                 width="stretch")
 
-    # Chart
+    # Chart: test-period predictions, each plotted on the date it is FOR
     st.subheader("📊 Actual vs Predicted Price")
-    split   = int(len(df) * 0.8)
-    test_df = df.iloc[split:].copy()
+    rows    = core.training_rows(df, features)
+    test_df = core.predict_frame(model, scaler, core.evaluation_window(rows, bundle), features)
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=list(range(len(test_df))), y=test_df['Close'],
+    fig.add_trace(go.Scatter(x=test_df.index, y=test_df['Actual'],
         mode='lines', name='Actual Price', line=dict(color='white', width=1.5)))
-    fig.add_trace(go.Scatter(x=list(range(len(test_df))), y=test_df['Predicted'],
+    fig.add_trace(go.Scatter(x=test_df.index, y=test_df['Predicted'],
         mode='lines', name='Predicted Price', line=dict(color='cyan', width=1.5, dash='dot')))
     if "price" in quote:
         fig.add_hline(y=quote["price"], line_dash="dash", line_color="orange",
                       annotation_text=f"Live: ${quote['price']:.2f}",
                       annotation_position="top right")
-    fig.update_layout(template='plotly_dark', xaxis_title='Trading Days (Test Set)',
+    fig.update_layout(template='plotly_dark', xaxis_title='Date (test period — not used for training)',
                       yaxis_title='Price (USD)', legend=dict(orientation='h', y=1.1),
                       height=450)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
+    st.caption("Each predicted point is yesterday's close × (1 + the model's predicted return), "
+               "plotted on the day it predicts.")
+    if core.is_legacy_bundle(bundle):
+        st.caption("⚠️ Old-format model: its test start date wasn't saved, so the test window is "
+                   "re-estimated as the last 20% of today's data and may overlap its training days.")
 
-    # Next-day prediction
+    # Next-day prediction (newest row with complete features)
     st.subheader("🔮 Next-Day Price Prediction")
-    pred_return   = model.predict(scaler.transform(df[features].tail(1)))[0]
-    last_close    = float(df['Close'].iloc[-1])
-    next_day_pred = last_close * (1 + pred_return)
-    delta         = next_day_pred - last_close
+    fc    = core.next_day_forecast(model, scaler, df, features)
+    delta = fc["predicted_close"] - fc["base_close"]
 
     p1,p2,p3 = st.columns(3)
-    p1.metric("Last Close",      f"${last_close:.2f}")
-    p2.metric("Predicted Close", f"${next_day_pred:.2f}", f"{delta:+.2f}")
-    p3.metric("Expected Move",   f"{pred_return*100:+.3f}%")
+    p1.metric(f"Last Close ({fc['base_date']:%Y-%m-%d})", f"${fc['base_close']:.2f}")
+    p2.metric(f"Predicted Close ({fc['target_date']:%a %Y-%m-%d})",
+              f"${fc['predicted_close']:.2f}", f"{delta:+.2f}")
+    p3.metric("Expected Move", f"{fc['predicted_return']*100:+.3f}%")
+    st.caption("Forecast date = next weekday after the latest daily bar (exchange holidays are not "
+               "accounted for). A learning project, not trading advice.")
 
-    # Metrics
+    # Metrics, with the naive baseline next to the model
     st.subheader("📐 Model Performance (Test Set)")
-    mse  = mean_squared_error(test_df['Close'], test_df['Predicted'])
-    rmse = np.sqrt(mse)
-    r2   = r2_score(test_df['Close'], test_df['Predicted'])
+    m = core.evaluate_predictions(test_df)
     m1,m2,m3 = st.columns(3)
-    m1.metric("RMSE",     f"{rmse:.4f}")
-    m2.metric("MSE",      f"{mse:.4f}")
-    m3.metric("R² Score", f"{r2:.4f}")
+    m1.metric("RMSE",     f"{m['rmse']:.4f}")
+    m2.metric("MSE",      f"{m['rmse']**2:.4f}")
+    m3.metric("R² Score", f"{m['r2']:.4f}")
+    b1,b2,b3,b4 = st.columns(4)
+    b1.metric("Naive RMSE (tomorrow = today)", f"{m['baseline_rmse']:.4f}")
+    b2.metric("Skill vs naive", f"{m['skill']:+.4f}", help="1 − RMSE / naive RMSE. Above 0 = beats naive.")
+    b3.metric("Directional accuracy", pct(m['directional_accuracy']))
+    b4.metric("Up-day share ('always up')", pct(m['up_day_share']))
+    st.caption(f"{m['n_test_days']} test days. A high R² on price is easy (naive scores high too); "
+               "compare RMSE with the naive RMSE and directional accuracy with the up-day share.")
 
+
+try:
+    if bundle is None:
+        raise FileNotFoundError(MODEL_PATH)
+    show_predictions(bundle, ticker, quote)
 except FileNotFoundError:
     st.error("❌ No trained model found. Click **Retrain Now** in the sidebar.")
 except Exception as e:
