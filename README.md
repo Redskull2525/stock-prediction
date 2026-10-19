@@ -189,15 +189,13 @@ scikit-learn
 
 ## 📊 Model Performance
 
-Typical evaluation metrics on 5-year AAPL data:
+The model predicts the **next-day return**. The app turns that return back into a price and reports RMSE and R² on that price. Both use a chronological 80/20 split, so the model never sees future data during training.
 
-```
-RMSE    : ~2.10
-MAE     : ~1.60
-R² Score: ~0.97–0.99
-```
+**How to read these numbers:** each day's price is very close to the previous day's. A naive "tomorrow = today" baseline already scores an R² of around 0.99 on price, so a high R² here does **not** mean the model predicts the market well. The fairer tests are:
+- whether the model beats that naive baseline on RMSE
+- how often it predicts the **direction** of the move (up or down) correctly
 
-*(Results vary with market conditions and retraining date.)*
+Adding both is the next improvement for this project. The live values appear in the app's Model Status panel and change with each retrain. This project is a learning exercise, not trading advice.
 
 ---
 
